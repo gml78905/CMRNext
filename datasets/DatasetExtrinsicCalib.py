@@ -214,6 +214,18 @@ class ReadPCD:
         return _read_pcd(file)
 
 
+def _list_point_cloud_files(directory, extensions=('pcd', 'bin')):
+    point_cloud_files = []
+    for name in sorted(os.listdir(directory)):
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path):
+            continue
+        extension = os.path.splitext(name)[1].lstrip('.').lower()
+        if extension in extensions:
+            point_cloud_files.append(name)
+    return point_cloud_files
+
+
 # Generic point cloud reader from https://github.com/PRBonn/kiss-icp
 def _get_point_cloud_reader(file_extension, first_scan_file):
         """Attempt to guess with try/catch blocks which is the best point cloud reader to use for
@@ -614,9 +626,8 @@ class DatasetHerculesRadarExtrinsicCalib(Dataset):
                 image_list = [f for f in os.listdir(layout['camera_dir']) if is_image(f)]
                 image_list.sort()
                 radar_names = {
-                    os.path.splitext(f)[0]
-                    for f in os.listdir(layout['radar_dir'])
-                    if f.endswith('.pcd')
+                    os.path.splitext(f)[0]: f
+                    for f in _list_point_cloud_files(layout['radar_dir'])
                 }
                 for image_name in image_list:
                     base_name = os.path.splitext(image_name)[0]
@@ -625,20 +636,22 @@ class DatasetHerculesRadarExtrinsicCalib(Dataset):
                     self.all_files.append({
                         'stamp': base_name,
                         'image_path': os.path.join(layout['camera_dir'], image_name),
-                        'sensor_path': os.path.join(layout['radar_dir'], base_name + '.pcd'),
+                        'sensor_path': os.path.join(layout['radar_dir'], radar_names[base_name]),
                         'image_name': image_name,
                         'scene': scene,
                     })
 
         first_scan_file = None
+        first_scan_ext = None
         for layout in self.scene_layouts.values():
-            radar_files = sorted([f for f in os.listdir(layout['radar_dir']) if f.endswith('.pcd')])
+            radar_files = _list_point_cloud_files(layout['radar_dir'])
             if radar_files:
                 first_scan_file = os.path.join(layout['radar_dir'], radar_files[0])
+                first_scan_ext = os.path.splitext(radar_files[0])[1].lstrip('.').lower()
                 break
         if first_scan_file is None:
             raise RuntimeError(f"No radar point clouds found under {dataset_dir}")
-        self.point_cloud_reader = _get_point_cloud_reader('pcd', first_scan_file)
+        self.point_cloud_reader = _get_point_cloud_reader(first_scan_ext, first_scan_file)
 
     def _resolve_root_calibration_file(self):
         candidates = [
