@@ -20,14 +20,18 @@ import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
 
-from datasets.DatasetExtrinsicCalib import DatasetGeneralExtrinsicCalib, DatasetPandasetExtrinsicCalib
+from datasets.DatasetExtrinsicCalib import DatasetGeneralExtrinsicCalib, DatasetPandasetExtrinsicCalib, \
+    DatasetHerculesRadarExtrinsicCalib
 from camera_model import CameraModel
 
 from models.get_model import get_model
 from quaternion_distances import quaternion_loss
 
 import matplotlib
-matplotlib.use('TkAgg')
+try:
+    matplotlib.use('TkAgg')
+except Exception:
+    matplotlib.use('Agg')
 
 import matplotlib.pyplot as plt
 from utils import (downsample_depth, merge_inputs, get_flow_zforward, quat2mat, tvector2mat,
@@ -37,6 +41,15 @@ from utils import (downsample_depth, merge_inputs, get_flow_zforward, quat2mat, 
 rcParams["figure.raise_window"] = False
 torch.backends.cudnn.benchmark = True
 torch.use_deterministic_algorithms(False)
+
+
+def infer_hercules_img_shape(dataset):
+    if len(dataset) == 0:
+        raise RuntimeError("No Hercules samples found for evaluation.")
+    first_image = Image.open(dataset.all_files[0]['image_path']).convert('RGB')
+    width = max(1, int(round(first_image.width * dataset.image_resize_scale)))
+    height = max(1, int(round(first_image.height * dataset.image_resize_scale)))
+    return [64 * ((height + 63) // 64), 64 * ((width + 63) // 64)]
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -225,6 +238,21 @@ def evaluate_calibration(_config, seed):
             img_shape[0] = 64 * ((img_shape[0] // 64) + 1)
         if img_shape[1] % 64 > 0:
             img_shape[1] = 64 * ((img_shape[1] // 64) + 1)
+    elif _config['dataset'] == 'hercules':
+        dataset_val = DatasetHerculesRadarExtrinsicCalib(
+            base_dir,
+            train=False,
+            max_r=_config['max_r'],
+            max_t=_config['max_t'],
+            use_reflectance=_config['use_reflectance'],
+            normalize_images=_config['normalize_images'],
+            val_scene=_config['val_scene'],
+        )
+        img_shape = infer_hercules_img_shape(dataset_val)
+        if _config['downsample']:
+            img_shape = [img_shape[0] // 2, img_shape[1] // 2]
+            img_shape[0] = 64 * ((img_shape[0] + 63) // 64)
+            img_shape[1] = 64 * ((img_shape[1] + 63) // 64)
     else:
         raise RuntimeError("Dataset unknown")
 
@@ -253,6 +281,8 @@ def evaluate_calibration(_config, seed):
                                                    max_t=_config['max_t'], use_reflectance=_config['use_reflectance'],
                                                    normalize_images=_config['normalize_images'],
                                                    dataset=_config['dataset'], cam=_config['cam'])
+    elif _config['dataset'] == 'hercules':
+        pass
 
     def init_fn(x):
         return _init_fn(x, seed)
@@ -752,6 +782,7 @@ def main():
     parser.add_argument('--quantile', type=float, default=1.0)
     parser.add_argument('--downsample', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--viz', type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument('--val_scene', type=str, nargs='*', default=None)
 
     args = parser.parse_args()
     _config = vars(args)

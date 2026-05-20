@@ -47,6 +47,174 @@ def read_calib_file(filepath):
     return data
 
 
+def _load_sync_pairs(pair_file, image_dir, sensor_dir):
+    def _index_files(directory):
+        file_map = {}
+        for name in sorted(os.listdir(directory)):
+            path = os.path.join(directory, name)
+            if not os.path.isfile(path):
+                continue
+            stem, _ = os.path.splitext(name)
+            file_map[stem] = path
+            file_map[name] = path
+            if stem.isdigit():
+                file_map[str(int(stem))] = path
+        return file_map
+
+    def _match_path(file_map, token):
+        candidates = [token]
+        stem = os.path.splitext(token)[0]
+        if stem not in candidates:
+            candidates.append(stem)
+        if token.isdigit():
+            candidates.append(str(int(token)))
+        if stem.isdigit():
+            candidates.append(str(int(stem)))
+        for candidate in candidates:
+            if candidate in file_map:
+                return file_map[candidate]
+        return None
+
+    image_map = _index_files(image_dir)
+    sensor_map = _index_files(sensor_dir)
+    pairs = []
+
+    with open(pair_file, 'r') as f:
+        for line_idx, line in enumerate(f):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            tokens = line.replace(',', ' ').split()
+            if len(tokens) < 2:
+                continue
+
+            # Skip header rows like "image_Cam0 radar_Continental".
+            if line_idx == 0 and (not tokens[0].isdigit() or not tokens[1].isdigit()):
+                continue
+
+            if not tokens[0].isdigit() or not tokens[1].isdigit():
+                continue
+
+            image_path = _match_path(image_map, tokens[0])
+            sensor_path = _match_path(sensor_map, tokens[1])
+            if image_path is None or sensor_path is None:
+                continue
+
+            pairs.append({
+                'stamp': tokens[0],
+                'image_path': image_path,
+                'sensor_path': sensor_path,
+                'image_name': os.path.basename(image_path),
+            })
+
+    return pairs
+
+
+def _read_pcd(file_path):
+    type_map = {
+        ('F', 4): np.float32,
+        ('F', 8): np.float64,
+        ('I', 1): np.int8,
+        ('I', 2): np.int16,
+        ('I', 4): np.int32,
+        ('I', 8): np.int64,
+        ('U', 1): np.uint8,
+        ('U', 2): np.uint16,
+        ('U', 4): np.uint32,
+        ('U', 8): np.uint64,
+    }
+
+    header = {}
+    header_lines = []
+    data_start = 0
+    with open(file_path, 'rb') as f:
+        while True:
+            line = f.readline()
+            if not line:
+                raise ValueError(f"Invalid PCD header: {file_path}")
+            data_start += len(line)
+            line_str = line.decode('ascii', errors='ignore').strip()
+            header_lines.append(line_str)
+            if not line_str or line_str.startswith('#'):
+                continue
+            parts = line_str.split()
+            key = parts[0].upper()
+            values = parts[1:]
+            header[key] = values
+            if key == 'DATA':
+                break
+
+        fields = header.get('FIELDS')
+        sizes = [int(v) for v in header.get('SIZE', [])]
+        types = header.get('TYPE', [])
+        counts = [int(v) for v in header.get('COUNT', ['1'] * len(fields))]
+        width = int(header.get('WIDTH', ['0'])[0])
+        height = int(header.get('HEIGHT', ['1'])[0])
+        points = int(header.get('POINTS', [str(width * height)])[0])
+        data_kind = header['DATA'][0].lower()
+
+        if not fields or not sizes or not types:
+            raise ValueError(f"Incomplete PCD header: {file_path}")
+        if not (len(fields) == len(sizes) == len(types) == len(counts)):
+            raise ValueError(f"Mismatched PCD header lengths: {file_path}")
+
+        dtype_fields = []
+        for name, size, typ, count in zip(fields, sizes, types, counts):
+            key = (typ.upper(), size)
+            if key not in type_map:
+                raise ValueError(f"Unsupported PCD field type {key} in {file_path}")
+            base_dtype = np.dtype(type_map[key])
+            if count == 1:
+                dtype_fields.append((name, base_dtype))
+            else:
+                dtype_fields.append((name, base_dtype, (count,)))
+        dtype = np.dtype(dtype_fields)
+
+        if data_kind == 'binary':
+            raw = f.read(points * dtype.itemsize)
+            if len(raw) < points * dtype.itemsize:
+                raise ValueError(f"Unexpected EOF in binary PCD: {file_path}")
+            data = np.frombuffer(raw, dtype=dtype, count=points)
+        elif data_kind == 'ascii':
+            f.seek(data_start)
+            data = np.loadtxt(f, dtype=dtype, comments='#')
+            if data.shape == ():
+                data = np.array([data], dtype=dtype)
+        else:
+            raise ValueError(f"Unsupported PCD DATA mode '{data_kind}' in {file_path}")
+
+    xyz = np.stack([data['x'], data['y'], data['z']], axis=1).astype(np.float32, copy=False)
+    if 'intensity' in data.dtype.names:
+        intensity = np.asarray(data['intensity'], dtype=np.float32).reshape(-1, 1)
+        return np.concatenate((xyz, intensity), axis=1)
+    return xyz
+
+
+def _retry_with_different_sample(dataset, idx, exc, sample_path=None, max_attempts=10):
+    dataset_len = len(dataset)
+    if dataset_len <= 1:
+        raise RuntimeError(f"Failed to load sample {sample_path or idx}: {exc}") from exc
+
+    print(f"[WARN] Skipping unreadable sample: {sample_path or idx} ({exc})")
+    for _ in range(max_attempts):
+        new_idx = np.random.randint(0, dataset_len)
+        if new_idx != idx:
+            return dataset.__getitem__(new_idx)
+
+    raise RuntimeError(f"Failed to resample after unreadable sample: {sample_path or idx}") from exc
+
+
+class ReadKITTI:
+    def __call__(self, file):
+        return np.fromfile(file, dtype=np.float32).reshape((-1, 4))
+
+
+class ReadPCD:
+    def __call__(self, file):
+        return _read_pcd(file)
+
+
 # Generic point cloud reader from https://github.com/PRBonn/kiss-icp
 def _get_point_cloud_reader(file_extension, first_scan_file):
         """Attempt to guess with try/catch blocks which is the best point cloud reader to use for
@@ -60,11 +228,14 @@ def _get_point_cloud_reader(file_extension, first_scan_file):
         if file_extension == "bin":
             print("[WARNING] Reading .bin files, the only format supported is the KITTI format")
 
-            class ReadKITTI:
-                def __call__(self, file):
-                    return np.fromfile(file, dtype=np.float32).reshape((-1, 4))
-
             return ReadKITTI()
+
+        if file_extension == "pcd":
+            print("Using native reader for .pcd data")
+
+            # Probe the first file once so failures surface immediately.
+            ReadPCD()(first_scan_file)
+            return ReadPCD()
 
         print('Trying to guess how to read your data')
         # first try open3d
@@ -302,7 +473,10 @@ class DatasetGeneralExtrinsicCalib(Dataset):
         if self.change_frame:
             pc_in = pc_in[[2, 0, 1, 3], :]
 
-        img = Image.open(img_path)
+        try:
+            img = Image.open(img_path).convert('RGB')
+        except OSError as exc:
+            return _retry_with_different_sample(self, idx, exc, img_path)
         h_mirror = False
         if np.random.rand() > 0.5 and self.train:
             h_mirror = True
@@ -317,9 +491,8 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             img_rotation = np.random.uniform(-5, 5)
         try:
             img = self.custom_transform(img, calib, img_rotation, h_mirror)
-        except OSError:
-            new_idx = np.random.randint(0, self.__len__())
-            return self.__getitem__(new_idx)
+        except OSError as exc:
+            return _retry_with_different_sample(self, idx, exc, img_path)
 
         # Rotate PointCloud for img_rotation
         if self.train:
@@ -354,6 +527,353 @@ class DatasetGeneralExtrinsicCalib(Dataset):
         if self.use_reflectance:
             sample['reflectance'] = reflectance
 
+        return sample
+
+
+class DatasetHerculesRadarExtrinsicCalib(Dataset):
+    image_resize_scale = 0.5
+
+    def __init__(self, dataset_dirs, transform=None, augmentation=False, use_reflectance=False, max_t=1.5,
+                 max_r=20., train=True, normalize_images=True, change_frame=False, val_scene=None):
+        super(DatasetHerculesRadarExtrinsicCalib, self).__init__()
+        if isinstance(dataset_dirs, list):
+            if len(dataset_dirs) != 1:
+                raise ValueError("Hercules dataset expects a single dataset root directory.")
+            dataset_dir = dataset_dirs[0]
+        else:
+            dataset_dir = dataset_dirs
+
+        self.dataset = 'hercules'
+        self.use_reflectance = use_reflectance
+        self.max_r = max_r
+        self.max_t = max_t
+        self.augmentation = augmentation
+        self.root_dir = dataset_dir
+        self.transform = transform
+        self.train = train
+        self.normalize_images = normalize_images
+        self.change_frame = change_frame
+        self.val_scene = [val_scene] if isinstance(val_scene, str) else val_scene
+
+        self.GTs_T_cam_radar = {}
+        self.K = {}
+        self.scene_data_dirs = {}
+        self.scene_layouts = {}
+        self.all_files = []
+        self.root_calib_file = self._resolve_root_calibration_file()
+
+        scene_list = [d for d in os.listdir(dataset_dir) if os.path.isdir(os.path.join(dataset_dir, d))]
+        scene_list.sort()
+
+        for scene in scene_list:
+            scene_path = os.path.join(dataset_dir, scene)
+            data_dir = self._resolve_scene_data_dir(scene_path)
+            if data_dir is not None:
+                self.scene_data_dirs[scene] = data_dir
+
+        if self.val_scene is None:
+            self.val_scene = [list(self.scene_data_dirs.keys())[0]] if self.scene_data_dirs else []
+
+        for scene, data_dir in self.scene_data_dirs.items():
+            calib_file = self.root_calib_file or self._resolve_scene_calibration_file(data_dir)
+            if not os.path.exists(calib_file):
+                continue
+
+            with open(calib_file, 'r') as f:
+                calib_data = yaml.safe_load(f)
+
+            K_matrix = self._extract_intrinsic(calib_data)
+            T_cam_radar = self._extract_extrinsic(calib_data)
+            if K_matrix is None or T_cam_radar is None:
+                continue
+
+            if self.image_resize_scale != 1.0:
+                K_matrix = K_matrix.copy()
+                K_matrix[0, 0] *= self.image_resize_scale
+                K_matrix[1, 1] *= self.image_resize_scale
+                K_matrix[0, 2] *= self.image_resize_scale
+                K_matrix[1, 2] *= self.image_resize_scale
+
+            layout = self._resolve_scene_layout(os.path.join(dataset_dir, scene), data_dir)
+            if layout is None:
+                continue
+
+            self.K[scene] = K_matrix
+            self.GTs_T_cam_radar[scene] = T_cam_radar
+            self.scene_layouts[scene] = layout
+
+            include_scene = scene not in self.val_scene if self.train else scene in self.val_scene
+            if not include_scene:
+                continue
+
+            if layout['pair_file'] is not None:
+                scene_pairs = _load_sync_pairs(layout['pair_file'], layout['camera_dir'], layout['radar_dir'])
+                for pair in scene_pairs:
+                    pair['scene'] = scene
+                    self.all_files.append(pair)
+            else:
+                image_list = [f for f in os.listdir(layout['camera_dir']) if is_image(f)]
+                image_list.sort()
+                radar_names = {
+                    os.path.splitext(f)[0]
+                    for f in os.listdir(layout['radar_dir'])
+                    if f.endswith('.pcd')
+                }
+                for image_name in image_list:
+                    base_name = os.path.splitext(image_name)[0]
+                    if base_name not in radar_names:
+                        continue
+                    self.all_files.append({
+                        'stamp': base_name,
+                        'image_path': os.path.join(layout['camera_dir'], image_name),
+                        'sensor_path': os.path.join(layout['radar_dir'], base_name + '.pcd'),
+                        'image_name': image_name,
+                        'scene': scene,
+                    })
+
+        first_scan_file = None
+        for layout in self.scene_layouts.values():
+            radar_files = sorted([f for f in os.listdir(layout['radar_dir']) if f.endswith('.pcd')])
+            if radar_files:
+                first_scan_file = os.path.join(layout['radar_dir'], radar_files[0])
+                break
+        if first_scan_file is None:
+            raise RuntimeError(f"No radar point clouds found under {dataset_dir}")
+        self.point_cloud_reader = _get_point_cloud_reader('pcd', first_scan_file)
+
+    def _resolve_root_calibration_file(self):
+        candidates = [
+            os.path.join(self.root_dir, 'calibration.yaml'),
+            os.path.join(self.root_dir, 'rlc_calibration.yaml'),
+        ]
+        for calib_file in candidates:
+            if os.path.exists(calib_file):
+                return calib_file
+        return None
+
+    def _resolve_scene_calibration_file(self, data_dir):
+        candidates = [
+            os.path.join(data_dir, 'calibration.yaml'),
+            os.path.join(data_dir, 'rlc_calibration.yaml'),
+        ]
+        if os.path.basename(data_dir) != 'CMRNext':
+            candidates.extend([
+                os.path.join(data_dir, 'CMRNext', 'calibration.yaml'),
+                os.path.join(data_dir, 'CMRNext', 'rlc_calibration.yaml'),
+            ])
+        for calib_file in candidates:
+            if os.path.exists(calib_file):
+                return calib_file
+        return candidates[0]
+
+    def _resolve_scene_data_dir(self, scene_path):
+        candidates = [scene_path, os.path.join(scene_path, 'CMRNext')]
+        for candidate in candidates:
+            if not os.path.isdir(candidate):
+                continue
+            has_legacy_dirs = (
+                os.path.isdir(os.path.join(candidate, 'camera')) and
+                os.path.isdir(os.path.join(candidate, 'radar'))
+            )
+            has_pair_dirs = os.path.isdir(os.path.join(candidate, 'offline'))
+            if has_legacy_dirs or has_pair_dirs:
+                return candidate
+        return None
+
+    def _resolve_scene_layout(self, scene_path, data_dir):
+        pair_filenames = [
+            'image_Cam0_radar_Continental.txt',
+            'image_left_radar_Continental.txt',
+        ]
+        pair_candidates = []
+        for pair_name in pair_filenames:
+            pair_candidates.extend([
+                os.path.join(scene_path, 'offline', 'synced_stamps', pair_name),
+                os.path.join(data_dir, 'offline', 'synced_stamps', pair_name),
+                os.path.join(os.path.dirname(data_dir), 'offline', 'synced_stamps', pair_name),
+            ])
+
+        sensor_root_candidates = [
+            os.path.join(scene_path, 'offline', 'sensor_data'),
+            os.path.join(data_dir, 'offline', 'sensor_data'),
+            os.path.join(os.path.dirname(data_dir), 'offline', 'sensor_data'),
+        ]
+        camera_dir_names = ['image_Cam0', 'image_left']
+        radar_dir_names = ['radar_Continental', 'radar']
+
+        for pair_file in pair_candidates:
+            if not os.path.exists(pair_file):
+                continue
+            for sensor_root in sensor_root_candidates:
+                for camera_dir_name in camera_dir_names:
+                    for radar_dir_name in radar_dir_names:
+                        camera_dir = os.path.join(sensor_root, camera_dir_name)
+                        radar_dir = os.path.join(sensor_root, radar_dir_name)
+                        if os.path.isdir(camera_dir) and os.path.isdir(radar_dir):
+                            return {
+                                'camera_dir': camera_dir,
+                                'radar_dir': radar_dir,
+                                'pair_file': pair_file,
+                            }
+
+        for camera_dir_name in ['camera', 'image_left']:
+            for radar_dir_name in ['radar', 'radar_Continental']:
+                camera_dir = os.path.join(data_dir, camera_dir_name)
+                radar_dir = os.path.join(data_dir, radar_dir_name)
+                if os.path.isdir(camera_dir) and os.path.isdir(radar_dir):
+                    return {
+                        'camera_dir': camera_dir,
+                        'radar_dir': radar_dir,
+                        'pair_file': None,
+                    }
+        return None
+
+    def _extract_intrinsic(self, calib_data):
+        K_matrix = None
+        if calib_data and 'camera' in calib_data and 'intrinsic' in calib_data['camera']:
+            K_matrix = np.array(calib_data['camera']['intrinsic'], dtype=np.float32)
+            if K_matrix.shape != (3, 3):
+                K_matrix = None
+        if K_matrix is None and calib_data and all(key in calib_data for key in ['fx', 'fy', 'cx', 'cy']):
+            K_matrix = np.array([
+                [float(calib_data['fx']), 0.0, float(calib_data['cx'])],
+                [0.0, float(calib_data['fy']), float(calib_data['cy'])],
+                [0.0, 0.0, 1.0],
+            ], dtype=np.float32)
+        return K_matrix
+
+    def _extract_extrinsic(self, calib_data):
+        T_cam_radar = None
+        if calib_data and 'extrinsic' in calib_data:
+            if 'T_cam_radar' in calib_data['extrinsic']:
+                T_cam_radar = np.array(calib_data['extrinsic']['T_cam_radar'], dtype=np.float32)
+                if T_cam_radar.shape != (4, 4):
+                    T_cam_radar = None
+            elif 'rotation' in calib_data['extrinsic'] and 'translation' in calib_data['extrinsic']:
+                rotation = np.array(calib_data['extrinsic']['rotation'], dtype=np.float32)
+                translation = np.array(calib_data['extrinsic']['translation'], dtype=np.float32)
+                if rotation.shape == (3, 3) and translation.shape == (3,):
+                    T_cam_radar = np.eye(4, dtype=np.float32)
+                    T_cam_radar[:3, :3] = rotation
+                    T_cam_radar[:3, 3] = translation
+        if T_cam_radar is None and calib_data and 'initial_extrinsic' in calib_data:
+            ext_list = np.array(calib_data['initial_extrinsic'], dtype=np.float32).reshape(-1)
+            if ext_list.size == 16:
+                T_cam_radar = ext_list.reshape(4, 4)
+        return T_cam_radar
+
+    def custom_transform(self, rgb, calib, img_rotation=0., flip=False):
+        if self.train:
+            color_transform = transforms.ColorJitter(0.2, 0.2, 0.2)
+            rgb = color_transform(rgb)
+        rgb = np.array(rgb)
+        if self.train:
+            if flip:
+                rgb = cv2.flip(rgb, 1)
+            height, width = rgb.shape[:2]
+            matrix = cv2.getRotationMatrix2D(tuple(calib[2:].numpy()), img_rotation, 1.0)
+            rgb = cv2.warpAffine(rgb, matrix, dsize=(width, height))
+        return torch.tensor(rgb).float()
+
+    def __len__(self):
+        return len(self.all_files)
+
+    def __getitem__(self, idx):
+        item = self.all_files[idx]
+        scene = item['scene']
+        img_path = item['image_path']
+        radar_path = item['sensor_path']
+
+        pc = self.point_cloud_reader(radar_path)
+        if pc.ndim == 1:
+            pc = pc.reshape(1, -1)
+        if pc.shape[1] < 3:
+            raise RuntimeError(f"Radar point cloud has invalid shape: {pc.shape}")
+        if pc.shape[1] == 3:
+            pc = np.concatenate((pc, np.ones((pc.shape[0], 1), dtype=np.float32)), axis=1)
+        else:
+            pc = pc[:, :4]
+
+        # Match the filtering used in the LCCNet Hercules radar loader.
+        mask = ((pc[:, 0] < -3.) | (pc[:, 0] > 3.) | (pc[:, 1] < -3.) | (pc[:, 1] > 3.))
+        pc = pc[mask]
+        if pc.shape[0] == 0:
+            raise RuntimeError(f"Radar point cloud became empty after filtering: {radar_path}")
+
+        calib_np = self.K[scene]
+        calib = torch.tensor([calib_np[0, 0], calib_np[1, 1], calib_np[0, 2], calib_np[1, 2]]).float()
+        cam2vel = torch.from_numpy(self.GTs_T_cam_radar[scene]).float()
+
+        if self.use_reflectance:
+            reflectance = torch.from_numpy(pc[:, -1]).float()
+        pc[:, -1] = 1.
+        pc_in = torch.from_numpy(pc.astype(np.float32))
+        pc_in = torch.mm(cam2vel, pc_in.t())
+        if self.change_frame:
+            pc_in = pc_in[[2, 0, 1, 3], :]
+
+        try:
+            img = Image.open(img_path).convert('RGB')
+            if self.image_resize_scale != 1.0:
+                resized_width = max(1, int(round(img.width * self.image_resize_scale)))
+                resized_height = max(1, int(round(img.height * self.image_resize_scale)))
+                img = img.resize((resized_width, resized_height), Image.BILINEAR)
+        except OSError as exc:
+            return _retry_with_different_sample(self, idx, exc, img_path)
+
+        h_mirror = False
+        if np.random.rand() > 0.5 and self.train:
+            h_mirror = True
+            if self.change_frame:
+                pc_in[1, :] *= -1
+            else:
+                pc_in[0, :] *= -1
+            calib[2] = img.size[0] - calib[2]
+
+        img_rotation = np.random.uniform(-5, 5) if self.train else 0.
+        try:
+            img = self.custom_transform(img, calib, img_rotation, h_mirror)
+        except OSError as exc:
+            return _retry_with_different_sample(self, idx, exc, img_path)
+
+        if self.train:
+            if self.change_frame:
+                R_img = mathutils.Euler((radians(img_rotation), 0, 0), 'XYZ')
+            else:
+                R_img = mathutils.Euler((0, 0, radians(img_rotation)), 'XYZ')
+            T_img = mathutils.Vector((0., 0., 0.))
+            pc_in = rotate_forward(pc_in, R_img, T_img)
+
+        max_angle = self.max_r
+        rotz = np.random.uniform(-max_angle, max_angle) * (np.pi / 180.0)
+        roty = np.random.uniform(-max_angle, max_angle) * (np.pi / 180.0)
+        rotx = np.random.uniform(-max_angle, max_angle) * (np.pi / 180.0)
+        transl_x = np.random.uniform(-self.max_t, self.max_t)
+        transl_y = np.random.uniform(-self.max_t, self.max_t)
+        transl_z = np.random.uniform(-self.max_t, min(self.max_t, 1.0))
+
+        if self.change_frame:
+            R = mathutils.Euler((rotx, roty, rotz), 'XYZ')
+            T = mathutils.Vector((transl_x, transl_y, transl_z))
+        else:
+            R = mathutils.Euler((roty, rotz, rotx), 'XYZ')
+            T = mathutils.Vector((transl_y, transl_z, transl_x))
+
+        R, T = invert_pose(R, T)
+        R, T = torch.tensor(R), torch.tensor(T)
+
+        sample = {
+            'rgb': img,
+            'point_cloud': pc_in,
+            'calib': calib,
+            'tr_error': T,
+            'rot_error': R,
+            'rgb_name': img_path,
+            'idx': idx,
+            'cam2vel': cam2vel,
+        }
+        if self.use_reflectance:
+            sample['reflectance'] = reflectance
         return sample
 
 
@@ -445,7 +965,10 @@ class DatasetPandasetExtrinsicCalib(Dataset):
 
         cam2vel = get_extrinsic_pandaset(self.camera)
 
-        img = Image.open(img_path)
+        try:
+            img = Image.open(img_path).convert('RGB')
+        except OSError as exc:
+            return _retry_with_different_sample(self, idx, exc, img_path)
         h_mirror = False
         if np.random.rand() > 0.5 and self.train:
             h_mirror = True
@@ -460,9 +983,8 @@ class DatasetPandasetExtrinsicCalib(Dataset):
             img_rotation = np.random.uniform(-5, 5)
         try:
             img = self.custom_transform(img, calib, img_rotation, h_mirror)
-        except OSError:
-            new_idx = np.random.randint(0, self.__len__())
-            return self.__getitem__(new_idx)
+        except OSError as exc:
+            return _retry_with_different_sample(self, idx, exc, img_path)
 
         # Rotate PointCloud for img_rotation
         if self.train:

@@ -22,8 +22,10 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.cuda import amp
 from matplotlib import cm
+from PIL import Image
 
-from datasets.DatasetExtrinsicCalib import DatasetGeneralExtrinsicCalib, DatasetPandasetExtrinsicCalib
+from datasets.DatasetExtrinsicCalib import DatasetGeneralExtrinsicCalib, DatasetPandasetExtrinsicCalib, \
+    DatasetHerculesRadarExtrinsicCalib
 from camera_model import CameraModel
 from flow_losses import RAFT_loss2
 from utils import resize_dense_vector
@@ -65,6 +67,19 @@ def uncertainty_to_color(_tensor, mask=None):
     color = jet(total_uncertainty)
     color = color[:, :, :3]
     return color
+
+
+def infer_hercules_img_shape(dataset_root, val_scene=None):
+    probe_dataset = DatasetHerculesRadarExtrinsicCalib(dataset_root, train=False, val_scene=val_scene)
+    if len(probe_dataset) == 0:
+        raise RuntimeError(f"No Hercules validation samples found under {dataset_root}")
+
+    first_image = Image.open(probe_dataset.all_files[0]['image_path']).convert('RGB')
+    width = max(1, int(round(first_image.width * probe_dataset.image_resize_scale)))
+    height = max(1, int(round(first_image.height * probe_dataset.image_resize_scale)))
+    height = 64 * ((height + 63) // 64)
+    width = 64 * ((width + 63) // 64)
+    return [height, width]
 
 
 def prepare_input(_config, device, idx, img_shape, mean, sample, std):
@@ -310,6 +325,9 @@ def main(gpu, _config, common_seed, world_size):
         logger = init_logger(f'/tmp/{wandb_run_id}.log', _config['resume'], _config['wandb'])
 
     img_shape = _config['img_shape']
+    if _config['hercules_only']:
+        img_shape = infer_hercules_img_shape(_config['data_folder_hercules'], _config['val_scene'])
+        _config['img_shape'] = img_shape
 
     if not os.path.exists(_config["savemodel"]) and rank == 0:
         os.mkdir(_config["savemodel"])
@@ -362,6 +380,7 @@ def main(gpu, _config, common_seed, world_size):
 
     if rank == 0:
         logger.info('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
+        print("DEBUG: model ready", flush=True)
 
     if _config['wandb'] and rank == 0:
         wandb.watch(model)
@@ -372,71 +391,87 @@ def main(gpu, _config, common_seed, world_size):
 
     mean = torch.tensor([0.485, 0.456, 0.406]).to(device)
     std = torch.tensor([0.229, 0.224, 0.225]).to(device)
+    if rank == 0:
+        print("DEBUG: mean/std ready", flush=True)
 
     # total_iter = starting_epoch * len(dataset)
     total_iter = 0
     for epoch in range(starting_epoch, _config['epochs']):
+        if rank == 0:
+            logger.info(f"Epoch {epoch}: building training dataset")
+            print(f"DEBUG: epoch {epoch} start", flush=True)
 
-        train_directories_kitti = []
-        for subdir in ['03', '05', '06', '07', '08', '09', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19',
-                       '20', '21']:
-            train_directories_kitti.append(os.path.join(_config['data_folder_kitti'], subdir))
-        train_directories_argo = []
-        base_dir = _config['data_folder_argo']
-        for subdir in ['train1', 'train2', 'train3']:
-            train_directories_argo.append(os.path.join(base_dir, subdir))
-        train_directories_pandaset = []
-        base_dir = _config['data_folder_panda']
-        for subdir in os.listdir(base_dir):
-            seq_num = int(subdir)
-            if (57 <= int(seq_num) <= 78) or int(seq_num) == 149:
-                continue
-            if subdir in ['011', '122', '124', '030', '109', '043', '084', '115', '090']:
-                continue
-            train_directories_pandaset.append(os.path.join(base_dir, subdir))
-
-        dataset_kitti = DatasetGeneralExtrinsicCalib(train_directories_kitti, train=True, max_r=_config['max_r'],
-                                                     max_t=_config['max_t'],
-                                                     use_reflectance=_config['use_reflectance'],
-                                                     normalize_images=_config['normalize_images'],
-                                                     dataset='kitti')
-        if not _config['kitti_only']:
-            dataset_argo = DatasetGeneralExtrinsicCalib(train_directories_argo, train=True, max_r=_config['max_r'],
-                                                        max_t=_config['max_t'],
-                                                        use_reflectance=_config['use_reflectance'],
-                                                        normalize_images=_config['normalize_images'],
-                                                        dataset='argoverse', cam='ring_front_center')
-            dataset_pandaset = DatasetPandasetExtrinsicCalib(train_directories_pandaset, train=True,
-                                                             max_r=_config['max_r'], max_t=_config['max_t'],
-                                                             use_reflectance=_config['use_reflectance'],
-                                                             normalize_images=_config['normalize_images'],
-                                                             sensor_id=0, camera='front_camera')
-            dataset_pandaset2 = DatasetPandasetExtrinsicCalib(train_directories_pandaset, train=True,
-                                                              max_r=_config['max_r'], max_t=_config['max_t'],
-                                                              use_reflectance=_config['use_reflectance'],
-                                                              normalize_images=_config['normalize_images'],
-                                                              sensor_id=1, camera='front_camera')
-            assert len(dataset_argo) != 0 and len(dataset_kitti) != 0 and len(dataset_pandaset) != 0 and len(
-                dataset_pandaset2) != 0, "Something wrong with the dataset"
-
-        # print("Len Kitti Dataset: ", len(dataset_kitti))
-        # print("Len Argo Dataset: ", len(dataset_argo))
-        # print("Len Panda Dataset: ", 2*len(dataset_pandaset))
-
-        if _config['kitti_only']:
-            dataset_train = dataset_kitti
+        if _config['hercules_only']:
+            dataset_train = DatasetHerculesRadarExtrinsicCalib(
+                _config['data_folder_hercules'],
+                train=True,
+                max_r=_config['max_r'],
+                max_t=_config['max_t'],
+                use_reflectance=_config['use_reflectance'],
+                normalize_images=_config['normalize_images'],
+                val_scene=_config['val_scene'],
+            )
         else:
-            kitti_idxs = np.arange(0, len(dataset_kitti))
-            np.random.shuffle(kitti_idxs)
-            dataset_kitti = torch.utils.data.Subset(dataset_kitti, kitti_idxs[:len(dataset_pandaset) * 2])
-            argo_idxs = np.arange(0, len(dataset_argo))
-            np.random.shuffle(argo_idxs)
-            dataset_argo = torch.utils.data.Subset(dataset_argo, argo_idxs[:len(dataset_pandaset) * 2])
-            dataset_train = torch.utils.data.ConcatDataset(
-                [dataset_argo, dataset_kitti, dataset_pandaset, dataset_pandaset2])
-            if len(dataset_train) != 36000 and rank == 0:
-                logger.warning(f"Dataset size is different than what is should be:\n"
-                               f"Expected size: 36000, Current size: {len(dataset_train)}")
+            train_directories_kitti = []
+            for subdir in ['03', '05', '06', '07', '08', '09', '10', '11', '12', '13', '14', '15', '16', '17',
+                           '18', '19', '20', '21']:
+                train_directories_kitti.append(os.path.join(_config['data_folder_kitti'], subdir))
+            train_directories_argo = []
+            base_dir = _config['data_folder_argo']
+            for subdir in ['train1', 'train2', 'train3']:
+                train_directories_argo.append(os.path.join(base_dir, subdir))
+            train_directories_pandaset = []
+            base_dir = _config['data_folder_panda']
+            for subdir in os.listdir(base_dir):
+                seq_num = int(subdir)
+                if (57 <= int(seq_num) <= 78) or int(seq_num) == 149:
+                    continue
+                if subdir in ['011', '122', '124', '030', '109', '043', '084', '115', '090']:
+                    continue
+                train_directories_pandaset.append(os.path.join(base_dir, subdir))
+
+            dataset_kitti = DatasetGeneralExtrinsicCalib(train_directories_kitti, train=True, max_r=_config['max_r'],
+                                                         max_t=_config['max_t'],
+                                                         use_reflectance=_config['use_reflectance'],
+                                                         normalize_images=_config['normalize_images'],
+                                                         dataset='kitti')
+            if not _config['kitti_only']:
+                dataset_argo = DatasetGeneralExtrinsicCalib(train_directories_argo, train=True,
+                                                            max_r=_config['max_r'], max_t=_config['max_t'],
+                                                            use_reflectance=_config['use_reflectance'],
+                                                            normalize_images=_config['normalize_images'],
+                                                            dataset='argoverse', cam='ring_front_center')
+                dataset_pandaset = DatasetPandasetExtrinsicCalib(train_directories_pandaset, train=True,
+                                                                 max_r=_config['max_r'], max_t=_config['max_t'],
+                                                                 use_reflectance=_config['use_reflectance'],
+                                                                 normalize_images=_config['normalize_images'],
+                                                                 sensor_id=0, camera='front_camera')
+                dataset_pandaset2 = DatasetPandasetExtrinsicCalib(train_directories_pandaset, train=True,
+                                                                  max_r=_config['max_r'], max_t=_config['max_t'],
+                                                                  use_reflectance=_config['use_reflectance'],
+                                                                  normalize_images=_config['normalize_images'],
+                                                                  sensor_id=1, camera='front_camera')
+                assert len(dataset_argo) != 0 and len(dataset_kitti) != 0 and len(dataset_pandaset) != 0 and len(
+                    dataset_pandaset2) != 0, "Something wrong with the dataset"
+
+            if _config['kitti_only']:
+                dataset_train = dataset_kitti
+            else:
+                kitti_idxs = np.arange(0, len(dataset_kitti))
+                np.random.shuffle(kitti_idxs)
+                dataset_kitti = torch.utils.data.Subset(dataset_kitti, kitti_idxs[:len(dataset_pandaset) * 2])
+                argo_idxs = np.arange(0, len(dataset_argo))
+                np.random.shuffle(argo_idxs)
+                dataset_argo = torch.utils.data.Subset(dataset_argo, argo_idxs[:len(dataset_pandaset) * 2])
+                dataset_train = torch.utils.data.ConcatDataset(
+                    [dataset_argo, dataset_kitti, dataset_pandaset, dataset_pandaset2])
+                if len(dataset_train) != 36000 and rank == 0:
+                    logger.warning(f"Dataset size is different than what is should be:\n"
+                                   f"Expected size: 36000, Current size: {len(dataset_train)}")
+
+        if rank == 0:
+            logger.info(f"Epoch {epoch}: training dataset ready with {len(dataset_train)} samples")
+            print(f"DEBUG: epoch {epoch} train dataset ready", flush=True)
 
         if epoch == starting_epoch:
             if starting_epoch == 0:
@@ -456,25 +491,41 @@ def main(gpu, _config, common_seed, world_size):
                             len(dataset_train) // (batch_size * world_size)))
             total_iter = starting_epoch * len(dataset_train)
 
-        test_directories_kitti = []
-        for subdir in ['00']:
-            test_directories_kitti.append(os.path.join(_config['data_folder_kitti'], subdir))
-        test_directories_argo = []
-        base_dir = _config['data_folder_argo']
-        for subdir in ['train1', 'train2', 'train3']:
-            test_directories_argo.append(os.path.join(base_dir, subdir))
-        test_directories_pandaset = []
-        base_dir = _config['data_folder_panda']
-        for subdir in ['011', '122', '124', '030', '109', '043', '084', '115', '090']:
-            test_directories_pandaset.append(os.path.join(base_dir, subdir))
+        if rank == 0:
+            logger.info(f"Epoch {epoch}: building validation dataset")
 
-        dataset_val_kitti = DatasetGeneralExtrinsicCalib(test_directories_kitti, train=False, max_r=_config['max_r'],
-                                                         max_t=_config['max_t'],
-                                                         use_reflectance=_config['use_reflectance'],
-                                                         normalize_images=_config['normalize_images'],
-                                                         dataset='kitti')
+        if _config['hercules_only']:
+            dataset_val = DatasetHerculesRadarExtrinsicCalib(
+                _config['data_folder_hercules'],
+                train=False,
+                max_r=_config['max_r'],
+                max_t=_config['max_t'],
+                use_reflectance=_config['use_reflectance'],
+                normalize_images=_config['normalize_images'],
+                val_scene=_config['val_scene'],
+            )
+        else:
+            test_directories_kitti = []
+            for subdir in ['00']:
+                test_directories_kitti.append(os.path.join(_config['data_folder_kitti'], subdir))
+            test_directories_argo = []
+            base_dir = _config['data_folder_argo']
+            for subdir in ['train1', 'train2', 'train3']:
+                test_directories_argo.append(os.path.join(base_dir, subdir))
+            test_directories_pandaset = []
+            base_dir = _config['data_folder_panda']
+            for subdir in ['011', '122', '124', '030', '109', '043', '084', '115', '090']:
+                test_directories_pandaset.append(os.path.join(base_dir, subdir))
 
-        dataset_val = dataset_val_kitti
+            dataset_val = DatasetGeneralExtrinsicCalib(test_directories_kitti, train=False, max_r=_config['max_r'],
+                                                       max_t=_config['max_t'],
+                                                       use_reflectance=_config['use_reflectance'],
+                                                       normalize_images=_config['normalize_images'],
+                                                       dataset='kitti')
+
+        if rank == 0:
+            logger.info(f"Epoch {epoch}: validation dataset ready with {len(dataset_val)} samples")
+            print(f"DEBUG: epoch {epoch} val dataset ready", flush=True)
 
         train_sampler = torch.utils.data.distributed.DistributedSampler(
             dataset_train,
@@ -490,6 +541,9 @@ def main(gpu, _config, common_seed, world_size):
         )
         train_sampler.set_epoch(epoch)
         val_sampler.set_epoch(epoch)
+
+        if rank == 0:
+            logger.info(f"Epoch {epoch}: building dataloaders with num_workers={num_worker}")
 
         init_fn = partial(_init_fn, epoch=epoch, seed=local_seed)
         TrainImgLoader = torch.utils.data.DataLoader(dataset=dataset_train,
@@ -513,9 +567,11 @@ def main(gpu, _config, common_seed, world_size):
                                                     pin_memory=True)
 
         if rank == 0:
+            logger.info(f"Epoch {epoch}: dataloaders ready")
             logger.info(f'Len Train: {len(TrainImgLoader)}')
             logger.info(f'Len Test: {len(TestImgLoader)}')
             logger.info(f'This is {epoch}-th epoch')
+            print(f"DEBUG: epoch {epoch} dataloaders ready", flush=True)
 
         EPOCH = epoch
         epoch_start_time = time.time()
@@ -529,8 +585,11 @@ def main(gpu, _config, common_seed, world_size):
 
         time_for_N_it = time.time()
         batch_idx = 0
+        train_progress_every = max(1, min(_config['print_every'], max(1, len(TrainImgLoader) // 20)))
         # Training #
         for batch_idx, sample in enumerate(TrainImgLoader):
+            if rank == 0 and batch_idx == 0:
+                print("DEBUG: first train batch fetched", flush=True)
             start_time = time.time()
             lidar_input = []
             rgb_input = []
@@ -642,6 +701,13 @@ def main(gpu, _config, common_seed, world_size):
                 total_train_loss += loss.item()
                 total_train_epe += epe.item()
                 total_iter += len(sample['rgb']) * world_size
+                if batch_idx == 0 or (batch_idx + 1) % train_progress_every == 0 or (batch_idx + 1) == len(TrainImgLoader):
+                    progress = 100.0 * (batch_idx + 1) / len(TrainImgLoader)
+                    print(
+                        f"TRAIN progress: epoch {epoch} {batch_idx + 1}/{len(TrainImgLoader)} "
+                        f"({progress:.1f}%) elapsed {time.time() - epoch_start_time:.1f}s",
+                        flush=True,
+                    )
             del loss, epe
             del target_mask1, target_mask2, target_mask3, target_mask4, target_mask5, target_mask6
             del target_flow1, target_flow2, target_flow3, target_flow4, target_flow5, target_flow6
@@ -665,6 +731,7 @@ def main(gpu, _config, common_seed, world_size):
         total_test_ece_v = 0.
 
         local_loss = 0.0
+        val_progress_every = max(1, len(TestImgLoader) // 10)
         for batch_idx, sample in enumerate(TestImgLoader):
             start_time = time.time()
             lidar_input = []
@@ -763,6 +830,13 @@ def main(gpu, _config, common_seed, world_size):
                                 (batch_idx, local_loss / 50,
                                  (time.time() - start_time) / lidar_input.shape[0]))
                     local_loss = 0.0
+                if batch_idx == 0 or (batch_idx + 1) % val_progress_every == 0 or (batch_idx + 1) == len(TestImgLoader):
+                    progress = 100.0 * (batch_idx + 1) / len(TestImgLoader)
+                    print(
+                        f"VAL progress: epoch {epoch} {batch_idx + 1}/{len(TestImgLoader)} "
+                        f"({progress:.1f}%)",
+                        flush=True,
+                    )
                 total_test_loss += loss.item()
                 total_test_epe += epe.item()
                 if f1 is not None:
@@ -840,7 +914,30 @@ def main(gpu, _config, common_seed, world_size):
             old_save_filename = savefilename
 
         # Cleanup
-        del sample, dataset_kitti, dataset_train, dataset_val, TrainImgLoader
+        try:
+            del sample
+        except NameError:
+            pass
+        try:
+            del dataset_kitti
+        except NameError:
+            pass
+        try:
+            del dataset_train
+        except NameError:
+            pass
+        try:
+            del dataset_val
+        except NameError:
+            pass
+        try:
+            del TrainImgLoader
+        except NameError:
+            pass
+        try:
+            del TestImgLoader
+        except NameError:
+            pass
 
     if rank == 0:
         logger.info('full training time = %.2f HR' % ((time.time() - start_full_time) / 3600))
@@ -861,6 +958,7 @@ def real_main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--savemodel', type=str, default='/media/RAIDONE/CATTANEOD/regnet/checkpoints_CMRFlowNet/')
     parser.add_argument('--data_folder_argo', type=str, default='/media/DATA/ARGO/only_center_camera/')
+    parser.add_argument('--data_folder_hercules', type=str, default=None)
     parser.add_argument('--data_folder_kitti', type=str, default='/home/cattaneod/Datasets/KITTI/sequences/')
     parser.add_argument('--data_folder_panda', type=str, default='/media/RAIDONE/DATASETS/pandaset')
     parser.add_argument('--use_reflectance', action='store_true', default=False)
@@ -890,7 +988,9 @@ def real_main():
     parser.add_argument('--amp', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--print_every', type=int, default=500)
     parser.add_argument('--uncertainty', type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument('--hercules_only', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--kitti_only', type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument('--val_scene', type=str, nargs='*', default=None)
     parser.add_argument('--fourier_levels', type=int, default=12)
     parser.add_argument('--weight_nll', type=float, default=-1.0)
     parser.add_argument('--der_type', type=str, default="NLL",
@@ -903,6 +1003,8 @@ def real_main():
     args = parser.parse_args()
     # print(args)
     _config = vars(args)
+    if _config['hercules_only'] and not _config['data_folder_hercules']:
+        raise ValueError("--data_folder_hercules is required when --hercules_only is enabled.")
     if _config['uncertainty']:
         raise NotImplementedError("Training with uncertainty is still untested.")
     if _config['no_scheduler']:

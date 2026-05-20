@@ -26,7 +26,8 @@ RUN apt-get update && apt-get install -y unzip nano build-essential git byobu cu
 RUN apt-get update && apt-get install -y unzip nano build-essential git byobu curl xclip python3 python3-pip make cmake
 
 # Additional dependencies for CMRNext
-RUN pip3 install torch==1.11.0+cu113 torchvision==0.12.0+cu113 torchaudio==0.11.0 --extra-index-url https://download.pytorch.org/whl/cu113
+RUN pip3 install "typing-extensions<4.6" && \
+    pip3 install torch==1.11.0+cu113 torchvision==0.12.0+cu113 torchaudio==0.11.0 --extra-index-url https://download.pytorch.org/whl/cu113
 RUN pip3 install numpy==1.20.3 scikit-image pyquaternion tqdm python-dateutil==2.8.2 open3d pillow==10.3.0 mathutils==2.81.2
 
 WORKDIR /root/opencv
