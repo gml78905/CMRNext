@@ -15,7 +15,7 @@ EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4}"
 NUM_WORKER="${NUM_WORKER:-8}"
 BASE_LR="${BASE_LR:-3e-4}"
 SEED="${SEED:-42}"
-GPU_IDS="${GPU_IDS:-0,1}"
+GPU_IDS="${GPU_IDS:-0}"
 GPU_COUNT="$(awk -F',' '{print NF}' <<< "$GPU_IDS")"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-}"
@@ -24,8 +24,6 @@ NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
 NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 
 export CUDA_VISIBLE_DEVICES="$GPU_IDS"
-export MASTER_ADDR
-export MASTER_PORT
 export NCCL_DEBUG
 export NCCL_ASYNC_ERROR_HANDLING
 export NCCL_IB_DISABLE
@@ -100,3 +98,6 @@ run_train() {
 
 run_train "hercules_radar" 1.5 20.0
 run_train "hercules_radar2" 1.0 10.0
+run_train "hercules_radar3" 0.5 5.0
+run_train "hercules_radar4" 0.5 3.0
+run_train "hercules_radar5" 0.5 2.0

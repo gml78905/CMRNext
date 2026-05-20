@@ -196,7 +196,6 @@ def _retry_with_different_sample(dataset, idx, exc, sample_path=None, max_attemp
     if dataset_len <= 1:
         raise RuntimeError(f"Failed to load sample {sample_path or idx}: {exc}") from exc
 
-    print(f"[WARN] Skipping unreadable sample: {sample_path or idx} ({exc})")
     for _ in range(max_attempts):
         new_idx = np.random.randint(0, dataset_len)
         if new_idx != idx:
