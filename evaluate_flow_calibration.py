@@ -1,4 +1,6 @@
 import argparse
+import copy
+import json
 import math
 import os
 import random
@@ -69,6 +71,210 @@ def quaternion_distance(q, r):
 
     dist = 180. * dist.item() / math.pi
     return dist
+
+
+def quaternion_to_rpy_deg(q):
+    """Convert a quaternion residual into absolute roll/pitch/yaw errors in degrees."""
+    rot = quat2mat(q)[:3, :3]
+    sy = torch.sqrt(rot[0, 0] ** 2 + rot[1, 0] ** 2)
+
+    if sy > 1e-6:
+        roll = torch.atan2(rot[2, 1], rot[2, 2])
+        pitch = torch.atan2(-rot[2, 0], sy)
+        yaw = torch.atan2(rot[1, 0], rot[0, 0])
+    else:
+        roll = torch.atan2(-rot[1, 2], rot[1, 1])
+        pitch = torch.atan2(-rot[2, 0], sy)
+        yaw = torch.tensor(0.0, device=rot.device, dtype=rot.dtype)
+
+    return (
+        torch.rad2deg(torch.abs(roll)).item(),
+        torch.rad2deg(torch.abs(pitch)).item(),
+        torch.rad2deg(torch.abs(yaw)).item(),
+    )
+
+
+def translation_axis_errors(t):
+    """Return absolute X/Y/Z translation errors in meters."""
+    return torch.abs(t[0]).item(), torch.abs(t[1]).item(), torch.abs(t[2]).item()
+
+
+def compute_summary(values):
+    tensor = torch.tensor(values, dtype=torch.float32)
+    return {
+        'mean': tensor.mean().item(),
+        'median': tensor.median().item(),
+        'std': tensor.std(unbiased=False).item(),
+    }
+
+
+def compute_trial_metrics(raw):
+    metrics = {
+        'rotation_error_mean': float(np.mean(raw['rot'])),
+        'rotation_error_std': float(np.std(raw['rot'])),
+        'rotation_error_median': float(np.median(raw['rot'])),
+        'translation_error_mean': float(np.mean(raw['trans'])),
+        'translation_error_std': float(np.std(raw['trans'])),
+        'translation_error_median': float(np.median(raw['trans'])),
+        'roll_error_mean': float(np.mean(raw['roll'])),
+        'roll_error_std': float(np.std(raw['roll'])),
+        'pitch_error_mean': float(np.mean(raw['pitch'])),
+        'pitch_error_std': float(np.std(raw['pitch'])),
+        'yaw_error_mean': float(np.mean(raw['yaw'])),
+        'yaw_error_std': float(np.std(raw['yaw'])),
+        'x_error_mean': float(np.mean(raw['x'])),
+        'x_error_std': float(np.std(raw['x'])),
+        'y_error_mean': float(np.mean(raw['y'])),
+        'y_error_std': float(np.std(raw['y'])),
+        'z_error_mean': float(np.mean(raw['z'])),
+        'z_error_std': float(np.std(raw['z'])),
+    }
+
+    for thresh in [1.0, 2.0, 5.0, 10.0]:
+        metrics[f'rot_success_{thresh}deg'] = 100.0 * float(np.mean(np.array(raw['rot']) < thresh))
+    for thresh in [0.1, 0.25, 0.5, 1.0]:
+        metrics[f'trans_success_{thresh}m'] = 100.0 * float(np.mean(np.array(raw['trans']) < thresh))
+
+    return metrics
+
+
+def trial_ci(all_metrics, key):
+    vals = np.array([m[key] for m in all_metrics], dtype=np.float64)
+    mean = float(vals.mean())
+    std = float(vals.std(ddof=1)) if len(vals) > 1 else 0.0
+    if len(vals) > 1:
+        from scipy import stats as scipy_stats
+        t_crit = scipy_stats.t.ppf(0.975, df=len(vals) - 1)
+        ci = float(t_crit * std / np.sqrt(len(vals)))
+    else:
+        ci = 0.0
+    return mean, std, ci
+
+
+def print_single_trial_tables(_config, trial_result):
+    errors_t = trial_result['errors_t']
+    errors_r = trial_result['errors_r']
+    final_calib_RTs = trial_result['final_calib_RTs']
+    sample_cam2vel = trial_result['sample_cam2vel']
+
+    console = Console()
+    table = Table(show_header=True, header_style="bold magenta", box=box.MINIMAL_HEAVY_HEAD, title_style="bold red")
+    table.title = f"CMRNext Results on {_config['dataset']}, camera {_config['cam']}"
+    table.add_column("Iteration")
+    table.add_column("Median Translation error (cm)", justify="center", max_width=20)
+    table.add_column("Median Rotation error (˚)", justify="center", max_width=20)
+    table.add_row(
+        "Initial Pose",
+        f"{errors_t[0].median().item() * 100:.2f}",
+        f"{errors_r[0].median().item():.2f}"
+    )
+    for iteration in range(1, len(_config['weights']) + 1):
+        table.add_row(
+            f"Iteration {iteration}",
+            f"{errors_t[iteration].median().item() * 100:.2f}",
+            f"{errors_r[iteration].median().item():.2f}"
+        )
+    print("")
+    print("")
+    console.print(table)
+
+    table = Table(show_header=True, header_style="bold magenta", box=box.MINIMAL_HEAVY_HEAD, title_style="bold red")
+    table.title = f"Temporal Aggregation Results on {_config['dataset']}"
+    table.add_column("Aggregation Measure", max_width=13)
+    table.add_column("Translation Error (cm)", justify="center")
+    table.add_column("Rotation Error (˚)", justify="center")
+
+    iteration = len(_config['weights'])
+    final_quats = np.stack([quaternion_from_matrix(t) for t in final_calib_RTs[iteration]])
+    r_error_avg = quaternion_distance(
+        torch.from_numpy(average_quaternions(final_quats)),
+        quaternion_from_matrix(sample_cam2vel)
+    )
+    r_error_mode = quaternion_distance(
+        quaternion_mode(final_quats, 4),
+        quaternion_from_matrix(sample_cam2vel)
+    )
+    if r_error_mode > quaternion_distance(
+            quaternion_mode(final_quats, 3),
+            quaternion_from_matrix(sample_cam2vel)
+    ):
+        r_error_mode = quaternion_distance(
+            quaternion_mode(final_quats, 3),
+            quaternion_from_matrix(sample_cam2vel)
+        )
+
+    final_translations = torch.stack(final_calib_RTs[iteration])[:, :3, 3]
+    t_error_avg = (final_translations.mean(0) - sample_cam2vel[:3, 3]).norm() * 100.
+    t_error_median = (final_translations.median(0)[0] - sample_cam2vel[:3, 3]).norm() * 100.
+    t_error_mode = (quaternion_mode(final_translations, 2) - sample_cam2vel[:3, 3]).norm() * 100.
+    if t_error_mode > (quaternion_mode(final_translations, 1) - sample_cam2vel[:3, 3]).norm() * 100.:
+        t_error_mode = (quaternion_mode(final_translations, 1) - sample_cam2vel[:3, 3]).norm() * 100.
+
+    table.add_row(
+        "Mean",
+        f"[bold green]{t_error_avg.item():.2f}[/bold green]" if t_error_avg.item() <= t_error_median.item() and
+                                                                t_error_avg.item() <= t_error_mode.item() else
+        f"{t_error_avg.item():.2f}",
+        f"[bold green]{r_error_avg:.2f}[/bold green]" if r_error_avg <= r_error_mode else
+        f"{r_error_avg:.2f}",
+    )
+    table.add_row(
+        "Median",
+        f"[bold green]{t_error_median.item():.2f}[/bold green]" if t_error_median.item() <= t_error_avg.item() and
+                                                                   t_error_median.item() <= t_error_mode.item() else
+        f"{t_error_median.item():.2f}",
+        "---"
+    )
+    table.add_row(
+        "Mode",
+        f"[bold green]{t_error_mode.item():.2f}[/bold green]" if t_error_mode.item() <= t_error_avg.item() and
+                                                                 t_error_mode.item() <= t_error_median.item() else
+        f"{t_error_mode.item():.2f}",
+        f"[bold green]{r_error_mode:.2f}[/bold green]" if r_error_mode <= r_error_avg else
+        f"{r_error_mode:.2f}"
+    )
+    print("")
+    print("")
+    console.print(table)
+
+
+def print_multi_trial_summary(all_metrics, all_trials, base_seed):
+    k = len(all_metrics)
+    print("\n" + "=" * 70)
+    print(f"EVALUATION RESULTS  ({k} trials, seeds {base_seed}..{base_seed + k - 1})")
+    print("=" * 70)
+
+    final_stage = all_trials[-1]['num_stages']
+    print(f"\nFinal Stage: {final_stage}")
+
+    for label, key, unit in [
+        ("Rotation Error", "rotation_error_mean", "°"),
+        ("Roll", "roll_error_mean", "°"),
+        ("Pitch", "pitch_error_mean", "°"),
+        ("Yaw", "yaw_error_mean", "°"),
+        ("Translation Error", "translation_error_mean", "m"),
+        ("X", "x_error_mean", "m"),
+        ("Y", "y_error_mean", "m"),
+        ("Z", "z_error_mean", "m"),
+    ]:
+        mean, std, ci = trial_ci(all_metrics, key)
+        print(f"  {label}: {mean:.4f}{unit}  ±{std:.4f}  95%CI [{mean-ci:.4f}, {mean+ci:.4f}]")
+
+    print(f"\n{'-' * 70}")
+    print("Success Rates  (mean across trials):")
+    print(f"{'-' * 70}")
+    for label, key in [
+        ("Rotation < 1°", 'rot_success_1.0deg'),
+        ("Rotation < 2°", 'rot_success_2.0deg'),
+        ("Rotation < 5°", 'rot_success_5.0deg'),
+        ("Rotation < 10°", 'rot_success_10.0deg'),
+        ("Trans < 0.10m", 'trans_success_0.1m'),
+        ("Trans < 0.25m", 'trans_success_0.25m'),
+        ("Trans < 0.50m", 'trans_success_0.5m'),
+        ("Trans < 1.00m", 'trans_success_1.0m'),
+    ]:
+        mean, std, ci = trial_ci(all_metrics, key)
+        print(f"  {label}: {mean:.1f}% ±{std:.1f}%  95%CI [{mean-ci:.1f}%, {mean+ci:.1f}%]")
 
 
 def prepare_input(cam_params, pc_rotated, real_shape, reflectance, _config, change_frame=False):
@@ -316,6 +522,12 @@ def evaluate_calibration(_config, seed):
 
     errors_r = []
     errors_t = []
+    errors_roll = []
+    errors_pitch = []
+    errors_yaw = []
+    errors_x = []
+    errors_y = []
+    errors_z = []
     list_quats = []
     list_transl = []
     epe = []
@@ -325,6 +537,12 @@ def evaluate_calibration(_config, seed):
     for i in range(len(_config['weights']) + 1):
         errors_r.append([])
         errors_t.append([])
+        errors_roll.append([])
+        errors_pitch.append([])
+        errors_yaw.append([])
+        errors_x.append([])
+        errors_y.append([])
+        errors_z.append([])
         list_quats.append([])
         list_transl.append([])
         epe.append([])
@@ -342,6 +560,14 @@ def evaluate_calibration(_config, seed):
                                                    torch.tensor([1., 0., 0., 0.], device=sample['rot_error'].device)))
 
             errors_t[0].append(sample['tr_error'][idx].norm().item())
+            roll0, pitch0, yaw0 = quaternion_to_rpy_deg(sample['rot_error'][idx])
+            x0, y0, z0 = translation_axis_errors(sample['tr_error'][idx])
+            errors_roll[0].append(roll0)
+            errors_pitch[0].append(pitch0)
+            errors_yaw[0].append(yaw0)
+            errors_x[0].append(x0)
+            errors_y[0].append(y0)
+            errors_z[0].append(z0)
             list_quats[0].append(sample['rot_error'][idx].cpu().numpy())
             list_transl[0].append(sample['tr_error'][idx].cpu().numpy())
 
@@ -486,6 +712,12 @@ def evaluate_calibration(_config, seed):
                 for left_iter in range(iteration + 1):
                     errors_t[left_iter].pop(-1)
                     errors_r[left_iter].pop(-1)
+                    errors_roll[left_iter].pop(-1)
+                    errors_pitch[left_iter].pop(-1)
+                    errors_yaw[left_iter].pop(-1)
+                    errors_x[left_iter].pop(-1)
+                    errors_y[left_iter].pop(-1)
+                    errors_z[left_iter].pop(-1)
                     list_transl[left_iter].pop(-1)
                     list_quats[left_iter].pop(-1)
                 break
@@ -534,6 +766,14 @@ def evaluate_calibration(_config, seed):
                                                                torch.tensor([1., 0., 0., 0.],
                                                                             device=R_composed.device)))
             errors_t[iteration + 1].append(T_composed.norm().item())
+            roll_i, pitch_i, yaw_i = quaternion_to_rpy_deg(R_composed)
+            x_i, y_i, z_i = translation_axis_errors(T_composed)
+            errors_roll[iteration + 1].append(roll_i)
+            errors_pitch[iteration + 1].append(pitch_i)
+            errors_yaw[iteration + 1].append(yaw_i)
+            errors_x[iteration + 1].append(x_i)
+            errors_y[iteration + 1].append(y_i)
+            errors_z[iteration + 1].append(z_i)
 
             list_transl[iteration + 1].append(T_composed.cpu().numpy())
             list_quats[iteration + 1].append(R_composed.cpu().numpy())
@@ -565,6 +805,12 @@ def evaluate_calibration(_config, seed):
                 for left_iteration in range(iteration + 2, len(_config['weights']) + 1):
                     errors_t[left_iteration].append(T_composed.norm().item())
                     errors_r[left_iteration].append(errors_r[iteration + 1][-1])
+                    errors_roll[left_iteration].append(roll_i)
+                    errors_pitch[left_iteration].append(pitch_i)
+                    errors_yaw[left_iteration].append(yaw_i)
+                    errors_x[left_iteration].append(x_i)
+                    errors_y[left_iteration].append(y_i)
+                    errors_z[left_iteration].append(z_i)
                 break
 
             # Rotate point cloud based on predicted pose, and generate new
@@ -638,6 +884,12 @@ def evaluate_calibration(_config, seed):
     for iteration in range(len(_config['weights']) + 1):
         errors_t[iteration] = torch.tensor(errors_t[iteration])
         errors_r[iteration] = torch.tensor(errors_r[iteration])
+        errors_roll[iteration] = torch.tensor(errors_roll[iteration])
+        errors_pitch[iteration] = torch.tensor(errors_pitch[iteration])
+        errors_yaw[iteration] = torch.tensor(errors_yaw[iteration])
+        errors_x[iteration] = torch.tensor(errors_x[iteration])
+        errors_y[iteration] = torch.tensor(errors_y[iteration])
+        errors_z[iteration] = torch.tensor(errors_z[iteration])
 
     if _config['dataset'] == 'custom' and len(final_calib_RTs[len(_config['weights'])]) == 1:
         print("Predicted extrinsic calibration:")
@@ -673,97 +925,48 @@ def evaluate_calibration(_config, seed):
         print("Predicted extrinsic calibration using mode aggregation:")
         print(mode_extrinsic_calib)
 
-    else:
-        console = Console()
-        table = Table(show_header=True, header_style="bold magenta", box=box.MINIMAL_HEAVY_HEAD, title_style="bold red")
-        table.title = f"CMRNext Results on {_config['dataset']}, camera {_config['cam']}"
-        table.add_column("Iteration")
-        table.add_column("Median Translation error (cm)", justify="center", max_width=20)
-        table.add_column("Median Rotation error (˚)", justify="center", max_width=20)
-        table.add_row(
-            f"Initial Pose",
-            f"{errors_t[0].median().item() * 100:.2f}",
-            f"{errors_r[0].median().item():.2f}"
-        )
-        for iteration in range(1, len(_config['weights']) + 1):
-            table.add_row(
-                f"Iteration {iteration}",
-                f"{errors_t[iteration].median().item() * 100:.2f}",
-                f"{errors_r[iteration].median().item():.2f}"
-            )
-        print("")
-        print("")
-        console.print(table)
+    raw = {
+        'rot': errors_r[-1].tolist(),
+        'trans': errors_t[-1].tolist(),
+        'roll': errors_roll[-1].tolist(),
+        'pitch': errors_pitch[-1].tolist(),
+        'yaw': errors_yaw[-1].tolist(),
+        'x': errors_x[-1].tolist(),
+        'y': errors_y[-1].tolist(),
+        'z': errors_z[-1].tolist(),
+    }
+    for key in ('x', 'y', 'z', 'trans'):
+        raw[f'{key}_cm'] = [value * 100.0 for value in raw[key]]
 
-        table = Table(show_header=True, header_style="bold magenta", box=box.MINIMAL_HEAVY_HEAD, title_style="bold red")
-        table.title = f"Temporal Aggregation Results on {_config['dataset']}"
-        table.add_column("Aggregation Measure", max_width=13)
-        table.add_column("Translation Error (cm)", justify="center")
-        table.add_column("Rotation Error (˚)", justify="center")
+    stage_summaries = []
+    for iteration in range(len(_config['weights']) + 1):
+        stage_summaries.append({
+            'translation': compute_summary(errors_t[iteration].tolist()),
+            'rotation': compute_summary(errors_r[iteration].tolist()),
+            'roll': compute_summary(errors_roll[iteration].tolist()),
+            'pitch': compute_summary(errors_pitch[iteration].tolist()),
+            'yaw': compute_summary(errors_yaw[iteration].tolist()),
+            'x': compute_summary(errors_x[iteration].tolist()),
+            'y': compute_summary(errors_y[iteration].tolist()),
+            'z': compute_summary(errors_z[iteration].tolist()),
+        })
 
-        iteration = len(_config['weights'])
-        final_quats = np.stack([quaternion_from_matrix(t) for t in final_calib_RTs[iteration]])
-        r_error_avg = quaternion_distance(
-            torch.from_numpy(average_quaternions(final_quats)),
-            quaternion_from_matrix(sample['cam2vel'][0])
-        )
-        # r_error_median = quaternion_distance(
-        #     quaternion_median(np.stack(final_quats)),
-        #     quaternion_from_matrix(sample['cam2vel'][0])
-        # )
-        r_error_mode = quaternion_distance(
-            quaternion_mode(final_quats, 4),
-            quaternion_from_matrix(sample['cam2vel'][0])
-        )
-        if r_error_mode > quaternion_distance(
-                quaternion_mode(final_quats, 3),
-                quaternion_from_matrix(sample['cam2vel'][0])
-        ):
-            r_error_mode = quaternion_distance(
-                quaternion_mode(final_quats, 3),
-                quaternion_from_matrix(sample['cam2vel'][0])
-            )
-
-        t_error_avg = (torch.stack(final_calib_RTs[iteration])[:, :3, 3].mean(0)
-                       - sample['cam2vel'][0][:3, 3]).norm() * 100.
-        t_error_median = (torch.stack(final_calib_RTs[iteration])[:, :3, 3].median(0)[0]
-                          - sample['cam2vel'][0][:3, 3]).norm() * 100.
-        t_error_mode = (quaternion_mode(torch.stack(final_calib_RTs[iteration])[:, :3, 3], 2)
-                        - sample['cam2vel'][0][:3, 3]).norm() * 100.
-        if t_error_mode > (quaternion_mode(torch.stack(final_calib_RTs[iteration])[:, :3, 3], 1)
-                           - sample['cam2vel'][0][:3, 3]).norm() * 100.:
-            t_error_mode = (quaternion_mode(torch.stack(final_calib_RTs[iteration])[:, :3, 3], 1)
-                            - sample['cam2vel'][0][:3, 3]).norm() * 100.
-        table.add_row(
-            "Mean",
-            f"[bold green]{t_error_avg.item():.2f}[/bold green]" if t_error_avg.item() <= t_error_median.item() and
-                                                                    t_error_avg.item() <= t_error_mode.item() else
-            f"{t_error_avg.item():.2f}",
-            f"[bold green]{r_error_avg:.2f}[/bold green]" if r_error_avg <= r_error_mode else
-            f"{r_error_avg:.2f}",
-        )
-        table.add_row(
-            "Median",
-            f"[bold green]{t_error_median.item():.2f}[/bold green]" if t_error_median.item() <= t_error_avg.item() and
-                                                                       t_error_median.item() <= t_error_mode.item() else
-            f"{t_error_median.item():.2f}",
-            f"---"
-        )
-        table.add_row(
-            "Mode",
-            f"[bold green]{t_error_mode.item():.2f}[/bold green]" if t_error_mode.item() <= t_error_avg.item() and
-                                                                     t_error_mode.item() <= t_error_median.item() else
-            f"{t_error_mode.item():.2f}",
-            f"[bold green]{r_error_mode:.2f}[/bold green]" if r_error_mode <= r_error_avg else
-            f"{r_error_mode:.2f}"
-        )
-        print("")
-        print("")
-        console.print(table)
+    trial_result = {
+        'errors_t': errors_t,
+        'errors_r': errors_r,
+        'raw': raw,
+        'metrics': compute_trial_metrics(raw),
+        'stage_summaries': stage_summaries,
+        'final_calib_RTs': final_calib_RTs,
+        'sample_cam2vel': sample['cam2vel'][0].cpu(),
+        'num_stages': len(_config['weights']),
+    }
 
     if _config['save_file'] is not None:
         torch.save(errors_t, f'./{_config["save_file"]}_errors_t.torch')
         torch.save(errors_r, f'./{_config["save_file"]}_errors_r.torch')
+
+    return trial_result
 
 
 def main():
@@ -783,10 +986,81 @@ def main():
     parser.add_argument('--downsample', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--viz', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--val_scene', type=str, nargs='*', default=None)
+    parser.add_argument('--num_trials', type=int, default=1)
+    parser.add_argument('--base_seed', type=int, default=42)
+    parser.add_argument('--save_errors', type=str, default=None)
+    parser.add_argument('--tag', type=str, default=None)
+    parser.add_argument('--compare', type=str, default=None)
 
     args = parser.parse_args()
     _config = vars(args)
-    evaluate_calibration(_config, _config['seed'])
+    trial_results = []
+
+    for trial_idx in range(args.num_trials):
+        seed = args.base_seed + trial_idx
+        if args.num_trials > 1:
+            print(f"\n[Trial {trial_idx + 1}/{args.num_trials}  seed={seed}]")
+        trial_config = copy.deepcopy(_config)
+        trial_config['seed'] = seed
+        if args.num_trials > 1:
+            trial_config['save_file'] = None
+        trial_results.append(evaluate_calibration(trial_config, seed))
+
+    if len(trial_results) == 1:
+        print_single_trial_tables(_config, trial_results[0])
+    else:
+        print_multi_trial_summary(
+            [trial['metrics'] for trial in trial_results],
+            trial_results,
+            args.base_seed,
+        )
+
+    if args.save_errors:
+        combined_raw = {
+            key: np.concatenate([np.array(trial['raw'][key]) for trial in trial_results]).tolist()
+            for key in trial_results[0]['raw']
+        }
+        combined_raw['num_trials'] = len(trial_results)
+        combined_raw['seeds'] = list(range(args.base_seed, args.base_seed + len(trial_results)))
+        combined_raw['n_samples'] = len(combined_raw['rot'])
+        combined_raw['label'] = args.tag or os.path.splitext(os.path.basename(args.save_errors))[0]
+
+        with open(args.save_errors, 'w') as f:
+            json.dump(combined_raw, f)
+        print(f"\nRaw errors saved -> {args.save_errors}")
+
+    if args.compare:
+        if not os.path.exists(args.compare):
+            print(f"\n[WARNING] --compare file not found: {args.compare}")
+        else:
+            from scipy import stats as scipy_stats
+            with open(args.compare, 'r') as f:
+                other_raw = json.load(f)
+
+            print(f"\n{'=' * 70}")
+            print(f"WILCOXON SIGNED-RANK TEST  (this method vs. {os.path.basename(args.compare)})")
+            print("Null hypothesis: error distributions are equal  (alternative: this < other)")
+            print(f"{'-' * 70}")
+            this_raw = combined_raw if args.save_errors else trial_results[-1]['raw']
+            for label, key in [
+                ("Rotation  (°)", 'rot'),
+                ("Roll      (°)", 'roll'),
+                ("Pitch     (°)", 'pitch'),
+                ("Yaw       (°)", 'yaw'),
+                ("Trans     (m)", 'trans'),
+                ("Trans-X   (m)", 'x'),
+                ("Trans-Y   (m)", 'y'),
+                ("Trans-Z   (m)", 'z'),
+            ]:
+                a = np.array(this_raw[key])
+                b = np.array(other_raw[key])
+                n = min(len(a), len(b))
+                stat, p = scipy_stats.wilcoxon(a[:n], b[:n], alternative='less')
+                direction = "A < B" if a[:n].mean() < b[:n].mean() else "A > B"
+                sig = "***" if p < 0.001 else ("**" if p < 0.01 else ("*" if p < 0.05 else "ns"))
+                print(f"  {label}: W={stat:.1f}, p={p:.4f} {sig}  ({direction})")
+            print(f"{'-' * 70}")
+            print("Significance: *** p<0.001  ** p<0.01  * p<0.05  ns p>=0.05")
 
 
 if __name__ == '__main__':
